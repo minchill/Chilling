@@ -611,7 +611,7 @@ async def team(ctx, action=None, *, name=None):
 # Kết thúc
 # ------------------------------
 print("[✅ TẢI TOÀN BỘ MODULE THÀNH CÔNG]")
-    def get_game_status_embed(show_dealer_card=False, is_game_over=False):
+def get_game_status_embed(show_dealer_card=False, is_game_over=False):
         player_cards_str = ", ".join(card_to_string(c) for c in player_hand)
         player_score = calculate_hand_value(player_hand)
         if show_dealer_card or is_game_over:
