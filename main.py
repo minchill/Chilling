@@ -1,36 +1,71 @@
-# main.py
+# ------------------ PART 1/6: INIT & DB ------------------
 import discord
 from discord.ext import commands
-import os
-import sqlite3
-import random
-import asyncio
+import os, random, sqlite3, asyncio, tempfile, time
 from datetime import datetime
 from gtts import gTTS
-import tempfile
-import time
-import logging
 
-# ---------------------------
-# CONFIG / LOGGING
-# ---------------------------
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-logger = logging.getLogger('yubabe_clone')
-
-TOKEN = os.getenv('DISCORD_TOKEN')  # Railway env var
-WELCOME_CHANNEL_ID = 123456789012345678  # <-- Thay bằng ID kênh welcome của bạn
-
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-intents.voice_states = True
-
-# We'll keep Discord commands prefix as '!' internally, but allow users to type `b...`
+# CONFIG
+TOKEN = os.getenv("DISCORD_TOKEN")
+WELCOME_CHANNEL_ID = 123456789012345678  # <-- đổi ID kênh ở đây
+intents = discord.Intents.all()
+# nội bộ vẫn dùng prefix '!' nhưng người dùng gõ 'b...' (on_message chuyển)
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# ---------------------------
-# GAME / DATA CONFIG
-# ---------------------------
+# DATABASE (thread-safe)
+DB_PATH = "yubabe_clone.db"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+c = conn.cursor()
+
+# tạo bảng nếu chưa có
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 0
+)''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS user_inventory (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    item_name TEXT,
+    rarity TEXT,
+    skin_percent INTEGER,
+    skill_main TEXT,
+    skill_sub1 TEXT,
+    skill_sub2 TEXT,
+    skill_sub3 TEXT,
+    skill_sub4 TEXT
+)''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS user_pets (
+    pet_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    pet_name TEXT,
+    rarity TEXT,
+    pet_skill TEXT,
+    is_hidden BOOLEAN,
+    level INTEGER DEFAULT 1,
+    element TEXT,
+    is_team_slot INTEGER DEFAULT 0
+)''')
+conn.commit()
+
+# Helpers: balance
+def get_balance(user_id):
+    c.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
+    r = c.fetchone()
+    if r:
+        return r[0]
+    c.execute('INSERT INTO users (user_id, balance) VALUES (?, ?)', (user_id, 0))
+    conn.commit()
+    return 0
+
+def update_balance(user_id, amount):
+    c.execute('INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)', (user_id, 0))
+    c.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
+    conn.commit()
+    return get_balance(user_id)
+
+# Random data
 RARITY_CONFIG = {
     "Hư Hại": 35, "Bình Thường": 30, "Hiếm Có": 20, "Sử Thi": 10,
     "Bán Thần Thoại": 4, "Thần Thoại": 0.9, "Đấng Cứu Thế": 0.1,
@@ -61,117 +96,43 @@ SKILLS = [
 ]
 
 PET_NAMES = [
-    "Lân Sư Rồng (Tết)", "Chim Lạc (Giỗ Tổ)", "Cóc Thần (Mưa)", "Thiên Cẩu (Trung Thu)", "Rồng Vàng (Mùng 1)",
-    "Hùng Vương Thần Lực", "Thánh Gióng", "Âu Cơ", "Lạc Long Quân", "Phù Đổng Thiên Vương",
-    "Hổ Đông Dương", "Voi Rừng Tây Nguyên", "Sơn Tinh", "Thủy Tinh", "Sếu Đầu Đỏ",
-    "Tinh Linh Ánh Sáng", "Bóng Ma Cổ", "Thần Tài Mini", "Tiên Nữ Hoa", "Quỷ Lửa",
+    "Lân Sư Rồng", "Chim Lạc", "Cóc Thần", "Thiên Cẩu", "Rồng Vàng",
+    "Hùng Vương", "Thánh Gióng", "Âu Cơ", "Lạc Long Quân", "Phù Đổng",
     *[f"Pet Chiến Đấu {i}" for i in range(1, 31)]
 ]
 
 PET_ELEMENTS = ["Lửa", "Nước", "Gió", "Đất", "Ánh Sáng", "Bóng Tối"]
-
 HIDDEN_PET_NAME = "Hồ Chí Minh Bất Tử"
 HIDDEN_PET_RARITY = "Đấng Cứu Thế"
-HIDDEN_PET_DATE = (5, 19)  # (month, day)
+HIDDEN_PET_DATE = (5, 19)
 
 WELCOME_MESSAGES = [
     "🎉 Chào mừng **{name}** đến với bến đỗ mới! Đã tặng **100** xu khởi nghiệp.",
-    "🥳 Woa! **{name}** đã xuất hiện! Sẵn sàng quẩy chưa? (100 xu đã vào ví)",
-    "👋 Huhu, mừng **{name}** ghé thăm! Mau vào tìm đồng đội nào. (100 xu)",
-    "👾 Thành viên mới **{name}** vừa hạ cánh. Cẩn thận, code bot tôi đã bị thay đổi! (100 xu)",
-    "🔔 Thông báo: **{name}** đã gia nhập. Xin hãy giữ trật tự! (100 xu)",
-    "😎 Một huyền thoại mới: **{name}**! Chào mừng! (100 xu khởi nghiệp)"
+    "🥳 Woa! **{name}** đã xuất hiện! (100 xu đã vào ví)",
+    "👋 Mừng **{name}** ghé thăm! Mau vào tìm đồng đội nào. (100 xu)",
 ]
-
 GOODBYE_MESSAGES = [
-    "💔 **{name}** đã rời đi. Tạm biệt và hẹn gặp lại!",
-    "👋 Cảm ơn **{name}** đã dành thời gian ở đây! Chúc may mắn.",
-    "😭 Một chiến binh **{name}** đã ngã xuống. Thế giới game cần bạn trở lại!",
-    "🚪 **{name}** thoát server. Chắc là đi ngủ sớm rồi! Bye!",
-    "🚨 **{name}** đã bị hệ thống phát hiện và rời đi.",
-    "✨ Chuyến đi bình an, **{name}**!"
+    "💔 **{name}** đã rời đi. Tạm biệt!",
+    "👋 Cảm ơn **{name}** đã ở lại!",
 ]
+# ------------------ PART 2/6: ITEM, PET HELPERS, DAILY, GACHA, BALANCE ------------------
 
-# ---------------------------
-# DATABASE SETUP (thread-safe conn)
-# ---------------------------
-DB_NAME = 'economy.db'
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-c = conn.cursor()
-
-# users, inventory, pets
-c.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance INTEGER DEFAULT 0
-)
-''')
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS user_inventory (
-    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    item_name TEXT,
-    rarity TEXT,
-    skin_percent INTEGER,
-    skill_main TEXT,
-    skill_sub1 TEXT, skill_sub2 TEXT, skill_sub3 TEXT, skill_sub4 TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-)
-''')
-
-c.execute('''
-CREATE TABLE IF NOT EXISTS user_pets (
-    pet_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    pet_name TEXT,
-    rarity TEXT,
-    pet_skill TEXT,
-    is_hidden BOOLEAN,
-    level INTEGER DEFAULT 1,
-    element TEXT,
-    is_team_slot INTEGER DEFAULT 0,
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-)
-''')
-conn.commit()
-
-# ---------------------------
-# DB helper functions
-# ---------------------------
-def get_balance(user_id):
-    c.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,))
-    result = c.fetchone()
-    if result:
-        return result[0]
-    c.execute('INSERT INTO users (user_id, balance) VALUES (?, ?)', (user_id, 0))
-    conn.commit()
-    return 0
-
-def update_balance(user_id, amount):
-    c.execute('INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0)', (user_id,))
-    c.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
-    conn.commit()
-    return get_balance(user_id)
-
-# ---------------------------
-# Random generators (weapons, pets, skills)
-# ---------------------------
+# random helpers
 def random_roll_rarity():
     return random.choices(RARITY_NAMES, weights=RARITY_WEIGHTS, k=1)[0]
 
-def random_roll_skills(num_skills):
-    return random.sample(SKILLS, k=min(num_skills, len(SKILLS)))
+def random_roll_skills(k):
+    return random.sample(SKILLS, k=min(k, len(SKILLS)))
 
 def random_roll_weapon():
     rarity = random_roll_rarity()
-    weapon_type = random.choice(WEAPON_TYPES)
-    skin_percent = random.randint(0, 100)
+    w = random.choice(WEAPON_TYPES)
+    skin = random.randint(0, 100)
     skills = random_roll_skills(5)
     return {
-        "name": f"[{rarity}] {weapon_type}",
+        "name": f"[{rarity}] {w}",
         "rarity": rarity,
-        "skin_percent": skin_percent,
+        "skin_percent": skin,
         "skill_main": skills[0],
         "skill_sub1": skills[1],
         "skill_sub2": skills[2],
@@ -180,442 +141,456 @@ def random_roll_weapon():
     }
 
 def add_item_to_inventory(user_id, item):
-    c.execute(
-        '''INSERT INTO user_inventory (user_id, item_name, rarity, skin_percent, skill_main, skill_sub1, skill_sub2, skill_sub3, skill_sub4) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        (user_id, item['name'], item['rarity'], item['skin_percent'], item['skill_main'], item['skill_sub1'], item['skill_sub2'], item['skill_sub3'], item['skill_sub4'])
-    )
+    c.execute('''INSERT INTO user_inventory (user_id, item_name, rarity, skin_percent, skill_main, skill_sub1, skill_sub2, skill_sub3, skill_sub4)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (user_id, item['name'], item['rarity'], item['skin_percent'],
+               item['skill_main'], item['skill_sub1'], item['skill_sub2'], item['skill_sub3'], item['skill_sub4']))
     conn.commit()
 
-# Pet helpers
-def add_pet_to_db(user_id, pet_name, rarity, pet_skill, is_hidden):
+# Pet DB helpers
+def add_pet_to_db(user_id, pet_name, rarity, pet_skill, is_hidden=False):
     element = random.choice(PET_ELEMENTS)
-    c.execute(
-        '''INSERT INTO user_pets (user_id, pet_name, rarity, pet_skill, is_hidden, element) 
-           VALUES (?, ?, ?, ?, ?, ?)''',
-        (user_id, pet_name, rarity, pet_skill, is_hidden, element)
-    )
+    c.execute('''INSERT INTO user_pets (user_id, pet_name, rarity, pet_skill, is_hidden, element)
+                 VALUES (?, ?, ?, ?, ?, ?)''', (user_id, pet_name, rarity, pet_skill, is_hidden, element))
     conn.commit()
 
 def calculate_pet_power(pet_row):
-    # pet_row tuple from SELECT: (pet_id, pet_name, rarity, pet_skill, is_hidden, level, element, is_team_slot)
-    # But depending on SELECT order we will handle appropriately; here we'll rely on our SELECTs producing:
-    # SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot
-    # So indices: 0 pet_id, 1 name, 2 rarity, 3 level, 4 element, 5 pet_skill, 6 is_team_slot
-    level = pet_row[3]
-    rarity = pet_row[2]
-    rarity_multipliers = {"Hư Hại": 1, "Bình Thường": 1.2, "Hiếm Có": 1.5, "Sử Thi": 2,
-                          "Bán Thần Thoại": 3, "Thần Thoại": 5, "Đấng Cứu Thế": 10}
-    base_power = level * 10
-    return base_power * rarity_multipliers.get(rarity, 1)
+    # Expected SELECT: pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot
+    # indices: 0 id,1 name,2 rarity,3 level,4 element,5 skill,6 slot
+    try:
+        level = pet_row[3]
+        rarity = pet_row[2]
+    except:
+        return 0
+    multipliers = {"Hư Hại":1, "Bình Thường":1.2, "Hiếm Có":1.5, "Sử Thi":2, "Bán Thần Thoại":3, "Thần Thoại":5, "Đấng Cứu Thế":10}
+    base = level * 10
+    return base * multipliers.get(rarity, 1)
 
-# ---------------------------
-# Blackjack helper
-# ---------------------------
-SUITS = ['♠️', '♥️', '♦️', '♣️']
-RANKS = {
-    '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, '10': 10,
-    'J': 10, 'Q': 10, 'K': 10, 'A': 11
-}
-
-def create_deck():
-    return [{'rank': rank, 'suit': suit} for rank in RANKS for suit in SUITS]
-
-def calculate_hand_value(hand):
-    value = sum(RANKS[card['rank']] for card in hand)
-    num_aces = sum(1 for card in hand if card['rank'] == 'A')
-    while value > 21 and num_aces > 0:
-        value -= 10
-        num_aces -= 1
-    return value
-
-def card_to_string(card):
-    return f"{card['rank']}{card['suit']}"
-
-# ---------------------------
-# on_message: convert 'b...' -> '!...' to allow bdaily/bzoo etc.
-# ---------------------------
-@bot.event
-async def on_message(message):
-    # ignore other bots
-    if message.author.bot:
-        return
-
-    # If message starts with 'b' followed by letters (no space), convert to internal !command
-    # Examples:
-    # bdaily  -> !daily
-    # bdaily args... -> !daily args...
-    # btts hello -> !tts hello
-    if message.content and message.content.startswith('b') and len(message.content) > 1:
-        # protect if user typed mention like <@...> (starts with '<') -> we won't convert
-        # but since message starts with 'b' safe to convert
-        # convert "bxyz" to "!xyz"
-        message.content = '!' + message.content[1:]
-
-    await bot.process_commands(message)
-
-# ---------------------------
-# Commands (core)
-# ---------------------------
-@bot.command(name='balance', aliases=['bal', 'tien', 'bbal'])
-async def balance_command(ctx, member: discord.Member = None):
+# COMMANDS: balance/daily/gacha
+@bot.command(name='balance', aliases=['bal','bbal','tien'])
+async def balance_command(ctx, member: discord.Member=None):
     member = member or ctx.author
     bal = get_balance(member.id)
-    await ctx.send(f"💰 Số dư hiện tại của **{member.display_name}** là: **{bal}** xu.")
+    await ctx.send(f"💰 Số dư của **{member.display_name}**: **{bal}** xu.")
 
 @bot.command(name='daily', aliases=['bdaily'])
 @commands.cooldown(1, 86400, commands.BucketType.user)
 async def daily_command(ctx):
-    user_id = ctx.author.id
-    DAILY_REWARD = 500
+    uid = ctx.author.id
+    reward = 500
     item = random_roll_weapon()
-    add_item_to_inventory(user_id, item)
-    update_balance(user_id, DAILY_REWARD)
-    await ctx.send(f"🎁 **{ctx.author.display_name}** hoàn thành **Nhiệm Vụ Ngày**! Nhận **{DAILY_REWARD}** xu và 1 Hòm Gacha Vũ khí: **{item['name']}**!")
+    add_item_to_inventory(uid, item)
+    update_balance(uid, reward)
+    await ctx.send(f"🎁 **{ctx.author.display_name}** nhận **{reward}** xu và 1 hòm: **{item['name']}**.")
     await balance_command(ctx)
 
 @daily_command.error
 async def daily_error(ctx, error):
     if isinstance(error, commands.CommandOnCooldown):
-        remaining_seconds = int(error.retry_after)
-        hours = remaining_seconds // 3600
-        minutes = (remaining_seconds % 3600) // 60
-        seconds = remaining_seconds % 60
-        await ctx.send(f"⏰ **{ctx.author.display_name}** ơi, Nhiệm Vụ Ngày sẽ tái tạo sau **{hours} giờ, {minutes} phút, {seconds} giây** nữa.")
+        secs = int(error.retry_after)
+        h = secs // 3600; m = (secs%3600)//60; s = secs%60
+        await ctx.send(f"⏰ Nhiệm vụ hàng ngày tái tạo sau **{h}g {m}p {s}s**.")
 
-@bot.command(name='gacha', aliases=['mohòm'])
-async def open_gacha_box(ctx):
+@bot.command(name='gacha', aliases=['mohom','mohòm'])
+async def gacha_command(ctx):
     COST = 500
-    user_id = ctx.author.id
-    if get_balance(user_id) < COST:
-        await ctx.send(f"❌ Bạn cần **{COST}** xu để mở hòm Gacha vũ khí.")
+    uid = ctx.author.id
+    if get_balance(uid) < COST:
+        await ctx.send(f"❌ Cần **{COST}** xu để mở hòm.")
         return
-    update_balance(user_id, -COST)
+    update_balance(uid, -COST)
     item = random_roll_weapon()
-    add_item_to_inventory(user_id, item)
-    details = (
-        f"Cấp độ: **{item['rarity']}**\n"
-        f"Chỉ số: Skin **{item['skin_percent']}%**\n"
-        f"Kỹ năng Chính: **{item['skill_main']}**\n"
-        f"Kỹ năng Phụ: {item['skill_sub1']}, {item['skill_sub2']}, {item['skill_sub3']}, {item['skill_sub4']}"
-    )
-    await ctx.send(f"📦 **{ctx.author.display_name}** mở hòm và nhận được **{item['name']}**!\n{details}")
+    add_item_to_inventory(uid, item)
+    await ctx.send(f"📦 **{ctx.author.display_name}** mở hòm và nhận **{item['name']}** (R: {item['rarity']}, Skin {item['skin_percent']}%).")
     await balance_command(ctx)
+    # ------------------ PART 3/6: HUNT, BZOO, BTEAM ------------------
 
 @bot.command(name='hunt', aliases=['bhunt'])
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def hunt_command(ctx):
-    user_id = ctx.author.id
+    uid = ctx.author.id
     if random.random() < 0.30:
         today = datetime.now()
         rarity = random_roll_rarity()
         is_hidden = False
-        if today.month == HIDDEN_PET_DATE[0] and today.day == HIDDEN_PET_DATE[1] and random.random() < 0.01:
-            pet_name = HIDDEN_PET_NAME
-            rarity = HIDDEN_PET_RARITY
-            is_hidden = True
-            message = f"🌟🌟 **Kỳ Tích!** Bạn đã tìm thấy {pet_name} - Pet **{rarity}** cực phẩm!"
+        if (today.month, today.day) == HIDDEN_PET_DATE and random.random() < 0.01:
+            pet_name = HIDDEN_PET_NAME; rarity = HIDDEN_PET_RARITY; is_hidden = True
+            msg = f"🌟 **Kỳ tích!** Bạn tìm thấy **{pet_name}** ({rarity})!"
         else:
             pet_name = random.choice(PET_NAMES)
-            message = f"🎉 **Chúc mừng!** Bạn đã bắt được Pet: **{pet_name}** ({rarity})!"
+            msg = f"🎉 Bạn bắt được Pet **{pet_name}** ({rarity})!"
         pet_skill = random.choice(SKILLS)
-        add_pet_to_db(user_id, pet_name, rarity, pet_skill, is_hidden)
-        await ctx.send(f"{message}\nKỹ năng Pet: **{pet_skill}**")
+        add_pet_to_db(uid, pet_name, rarity, pet_skill, is_hidden)
+        await ctx.send(f"{msg}\nKỹ năng pet: **{pet_skill}**")
     else:
-        update_balance(user_id, 50)
-        await ctx.send("💔 Bạn đi săn nhưng không thấy Pet nào. Nhận **50** xu an ủi.")
+        update_balance(uid, 50)
+        await ctx.send("💔 Không thấy pet. Nhận 50 xu an ủi.")
     await balance_command(ctx)
 
-# Pet storage (bzoo)
-@bot.command(name='bzoo', aliases=['bz', 'bpet', 'pet'])
+@bot.command(name='bzoo', aliases=['bz','bpet'])
 async def pet_zoo_command(ctx):
-    user_id = ctx.author.id
-    c.execute('SELECT pet_id, pet_name, rarity, level, element, is_team_slot FROM user_pets WHERE user_id = ? ORDER BY is_team_slot DESC, pet_id ASC', (user_id,))
+    uid = ctx.author.id
+    c.execute('SELECT pet_id, pet_name, rarity, level, element, is_team_slot FROM user_pets WHERE user_id = ? ORDER BY is_team_slot DESC, pet_id ASC', (uid,))
     pets = c.fetchall()
     if not pets:
-        return await ctx.send("😔 Kho Pet của bạn đang trống. Hãy dùng `bhunt` để đi săn!")
-    embed = discord.Embed(title=f"🦴 Kho Pet của {ctx.author.display_name} ({len(pets)} Pet)", color=0xFEE3F5)
-    description = []
+        await ctx.send("😔 Kho pet trống. Dùng `bhunt` để đi săn.")
+        return
+    embed = discord.Embed(title=f"🦴 Kho Pet của {ctx.author.display_name} ({len(pets)} pet)", color=0xFEE3F5)
+    lines = []
     for pet in pets:
         pet_id, name, rarity, level, element, team_slot = pet
-        status = f" | **[SLOT {team_slot}]** 🛡️" if team_slot > 0 else ""
-        rarity_emoji = "🌟" if rarity in ["Thần Thoại", "Đấng Cứu Thế"] else "✨" if rarity in ["Sử Thi", "Bán Thần Thoại"] else ""
-        description.append(f"`#{pet_id}`{status} **{name}** ({rarity_emoji}{rarity})\n   Lv: **{level}** | Thuộc tính: **{element}**")
-    embed.description = "\n".join(description)
-    embed.set_footer(text="Dùng bteam add <ID Pet> <Slot 1-3> để thêm Pet vào đội.")
+        slot_text = f" | [SLOT {team_slot}]" if team_slot and team_slot>0 else ""
+        emoji = "🌟" if rarity in ["Thần Thoại","Đấng Cứu Thế"] else "✨" if rarity in ["Sử Thi","Bán Thần Thoại"] else ""
+        lines.append(f"`#{pet_id}`{slot_text} **{name}** ({emoji}{rarity}) — Lv: **{level}** | {element}")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Dùng bteam add <ID> <Slot 1-3> để đưa pet vào đội.")
     await ctx.send(embed=embed)
 
-# bteam group
+# bteam group: xem/add/remove
 @bot.group(name='bteam', invoke_without_command=True)
-async def pet_team_group(ctx):
-    user_id = ctx.author.id
-    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (user_id,))
-    team_pets_data = c.fetchall()
-    embed = discord.Embed(title=f"🛡️ Đội Pet Chiến Đấu của {ctx.author.display_name}", description="Đội hình hiện tại:\n", color=0x40E0D0)
-    if not team_pets_data:
-        embed.description += "Chưa có Pet nào trong đội. Dùng `bteam add <ID> <Slot 1-3>`."
-    team_slots = {i: None for i in range(1, 4)}
-    for pet in team_pets_data:
-        pet_id, name, rarity, level, element, skill, slot_num = pet
-        team_slots[slot_num] = (pet_id, name, rarity, level, element, skill)
-    for slot, pet_data in team_slots.items():
-        if pet_data:
-            pet_id, name, rarity, level, element, skill = pet_data
-            embed.add_field(name=f"SLOT {slot} (ID: #{pet_id})", value=f"**{name}** ({rarity})\nLv: **{level}** | **{element}** | Skill: *{skill}*", inline=False)
-        else:
-            embed.add_field(name=f"SLOT {slot}", value=f"[Trống] - Dùng `bteam add <ID> {slot}`", inline=False)
+async def bteam_group(ctx):
+    uid = ctx.author.id
+    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (uid,))
+    team = c.fetchall()
+    embed = discord.Embed(title=f"🛡️ Đội Pet của {ctx.author.display_name}", color=0x40E0D0)
+    if not team:
+        embed.description = "Chưa có pet trong đội. Dùng `bteam add <ID> <1-3>`."
+    else:
+        for pet in team:
+            pid, name, rarity, level, element, skill, slot = pet
+            embed.add_field(name=f"SLOT {slot} — #{pid}", value=f"**{name}** ({rarity}) Lv{level} | {element} | {skill}", inline=False)
     await ctx.send(embed=embed)
 
-@pet_team_group.command(name='add')
-async def pet_team_add(ctx, pet_id: int, slot: int):
-    user_id = ctx.author.id
+@bteam_group.command(name='add')
+async def bteam_add(ctx, pet_id: int, slot: int):
+    uid = ctx.author.id
     if slot not in [1,2,3]:
-        return await ctx.send("❌ Slot đội phải là số **1, 2, hoặc 3**.")
-    c.execute('SELECT pet_name, is_team_slot FROM user_pets WHERE user_id = ? AND pet_id = ?', (user_id, pet_id))
-    pet_data = c.fetchone()
-    if not pet_data:
-        return await ctx.send(f"❌ Không tìm thấy Pet có ID `#{pet_id}` trong kho của bạn.")
-    pet_name, current_slot = pet_data
-    # Bỏ pet cũ ở slot mục tiêu
-    c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND is_team_slot = ?', (user_id, slot))
-    # Nếu pet đang ở slot khác, clear
-    if current_slot != 0:
-        c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND pet_id = ?', (user_id, pet_id))
-    # Đặt pet vào slot
-    c.execute('UPDATE user_pets SET is_team_slot = ? WHERE user_id = ? AND pet_id = ?', (slot, user_id, pet_id))
+        await ctx.send("❌ Slot phải là 1,2 hoặc 3.")
+        return
+    c.execute('SELECT pet_name, is_team_slot FROM user_pets WHERE user_id = ? AND pet_id = ?', (uid, pet_id))
+    row = c.fetchone()
+    if not row:
+        await ctx.send("❌ Không tìm thấy pet ID này.")
+        return
+    pet_name, current = row
+    # clear target slot
+    c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND is_team_slot = ?', (uid, slot))
+    # clear current slot of this pet if any
+    if current and current>0:
+        c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND pet_id = ?', (uid, pet_id))
+    # set new slot
+    c.execute('UPDATE user_pets SET is_team_slot = ? WHERE user_id = ? AND pet_id = ?', (slot, uid, pet_id))
     conn.commit()
-    await ctx.send(f"✅ Pet **{pet_name}** (`#{pet_id}`) đã được thêm vào **SLOT {slot}** của đội hình chiến đấu!")
+    await ctx.send(f"✅ Đã thêm **{pet_name}** vào SLOT {slot}.")
 
-@pet_team_group.command(name='remove', aliases=['rm'])
-async def pet_team_remove(ctx, slot: int):
-    user_id = ctx.author.id
+@bteam_group.command(name='remove', aliases=['rm'])
+async def bteam_remove(ctx, slot: int):
+    uid = ctx.author.id
     if slot not in [1,2,3]:
-        return await ctx.send("❌ Slot đội phải là số **1, 2, hoặc 3**.")
-    c.execute('SELECT pet_name FROM user_pets WHERE user_id = ? AND is_team_slot = ?', (user_id, slot))
-    pet_data = c.fetchone()
-    if not pet_data:
-        return await ctx.send(f"❌ Slot {slot} đã trống.")
-    pet_name = pet_data[0]
-    c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND is_team_slot = ?', (user_id, slot))
+        await ctx.send("❌ Slot phải là 1,2 hoặc 3.")
+        return
+    c.execute('SELECT pet_name FROM user_pets WHERE user_id = ? AND is_team_slot = ?', (uid, slot))
+    r = c.fetchone()
+    if not r:
+        await ctx.send("❌ Slot trống.")
+        return
+    pet_name = r[0]
+    c.execute('UPDATE user_pets SET is_team_slot = 0 WHERE user_id = ? AND is_team_slot = ?', (uid, slot))
     conn.commit()
-    await ctx.send(f"✅ Đã loại Pet **{pet_name}** khỏi **SLOT {slot}**.")
+    await ctx.send(f"✅ Đã loại **{pet_name}** khỏi SLOT {slot}.")
+    # ------------------ PART 4/6: BBATTLE (3v3) + INVENTORY/SHOP ------------------
 
-# bbattle
 @bot.command(name='bbattle', aliases=['bb'])
-async def battle_command(ctx, member: discord.Member):
+async def bbattle(ctx, member: discord.Member):
     if member.id == ctx.author.id:
-        return await ctx.send("❌ Bạn không thể chiến đấu với chính mình.")
-    user_id = ctx.author.id
-    opponent_id = member.id
-    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (user_id,))
+        await ctx.send("❌ Không thể chiến đấu chính mình.")
+        return
+    uid = ctx.author.id; oid = member.id
+    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (uid,))
     my_team = c.fetchall()
-    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (opponent_id,))
-    opponent_team = c.fetchall()
-    if len(my_team) != 3 or len(opponent_team) != 3:
-        return await ctx.send("❌ Cả bạn và đối thủ phải có đủ **3 Pet** trong đội hình chiến đấu (`bteam add`).")
+    c.execute('SELECT pet_id, pet_name, rarity, level, element, pet_skill, is_team_slot FROM user_pets WHERE user_id = ? AND is_team_slot > 0 ORDER BY is_team_slot ASC', (oid,))
+    op_team = c.fetchall()
+    if len(my_team) != 3 or len(op_team) != 3:
+        await ctx.send("❌ Cả hai phải có đủ 3 pet trong đội (bteam add).")
+        return
     my_power = sum(calculate_pet_power(p) for p in my_team)
-    opponent_power = sum(calculate_pet_power(p) for p in opponent_team)
-    WIN_AMOUNT = 300
-    LOSE_AMOUNT = -100
-    if my_power > opponent_power:
-        update_balance(user_id, WIN_AMOUNT)
-        battle_result = f"🎉 **Chiến Thắng!** Đội của bạn mạnh hơn đội {member.display_name}. Bạn nhận được **{WIN_AMOUNT}** xu!"
+    op_power = sum(calculate_pet_power(p) for p in op_team)
+    WIN = 300; LOSE = -100
+    if my_power > op_power:
+        update_balance(uid, WIN); res = f"🎉 Bạn thắng! +{WIN} xu."
         color = 0x00FF00
-    elif opponent_power > my_power:
-        update_balance(user_id, LOSE_AMOUNT)
-        battle_result = f"💔 **Thất Bại!** Đội của {member.display_name} mạnh hơn đội của bạn. Bạn bị trừ **100** xu."
+    elif op_power > my_power:
+        update_balance(uid, LOSE); res = f"💔 Thua! {LOSE} xu."
         color = 0xFF0000
     else:
-        battle_result = "🤝 **Hòa!** Sức mạnh cân bằng. Không ai thắng thua."
-        color = 0xFFFF00
-    embed = discord.Embed(title="⚔️ KẾT QUẢ ĐẠI CHIẾN PET ⚔️", description=battle_result, color=color)
-    embed.add_field(name=f"{ctx.author.display_name}", value=f"Tổng Sức Mạnh: **{int(my_power)}**", inline=True)
-    embed.add_field(name=f"{member.display_name}", value=f"Tổng Sức Mạnh: **{int(opponent_power)}**", inline=True)
-    await ctx.send(embed=embed)
+        res = "🤝 Hòa! Không ai đổi xu."; color = 0xFFFF00
+    em = discord.Embed(title="⚔️ Kết quả chiến đấu Pet", description=res, color=color)
+    em.add_field(name=ctx.author.display_name, value=f"Sức mạnh: {int(my_power)}", inline=True)
+    em.add_field(name=member.display_name, value=f"Sức mạnh: {int(op_power)}", inline=True)
+    await ctx.send(embed=em)
 
-# Blackjack (bj / blackjack)
-# ------------------------------
-# Blackjack (bj / blackjack)
-# ------------------------------
-@bot.command(name="blackjack", aliases=["bj"])
-async def blackjack(ctx, bet: int = 0):
-    """Chơi bài blackjack kiếm xu"""
+# Inventory: xem item
+@bot.command(name='inv', aliases=['inventory','bag'])
+async def inventory(ctx):
+    uid = ctx.author.id
+    c.execute('SELECT item_id, item_name, rarity, skin_percent FROM user_inventory WHERE user_id = ? ORDER BY item_id DESC', (uid,))
+    items = c.fetchall()
+    if not items:
+        await ctx.send("🎒 Kho đồ trống.")
+        return
+    lines = []
+    for it in items:
+        iid, name, rarity, skin = it
+        lines.append(f"`#{iid}` **{name}** ({rarity}) - Skin {skin}%")
+    txt = "\n".join(lines[:20])
+    await ctx.send(f"🎒 Kho đồ của {ctx.author.display_name}:\n{txt}")
+
+# Simple shop: đổi xu lấy hộp gacha (dùng bshop mua gacha)
+@bot.command(name='bshop', aliases=['shop'])
+async def shop(ctx, item: str = None):
+    if not item:
+        return await ctx.send("🛒 Shop: `bshop gacha` (500 xu) hoặc `bshop info`")
+    if item.lower() == 'gacha':
+        COST = 500
+        uid = ctx.author.id
+        if get_balance(uid) < COST:
+            return await ctx.send("❌ Không đủ xu để mua.")
+        update_balance(uid, -COST)
+        item = random_roll_weapon()
+        add_item_to_inventory(uid, item)
+        return await ctx.send(f"📦 Mua gacha thành công: **{item['name']}** ({item['rarity']})")
+    if item.lower() == 'info':
+        return await ctx.send("🛒 Gacha: 500 xu -> Có thể nhận vũ khí ngẫu nhiên.")
+        # ------------------ PART 5/6: BLACKJACK + on_message + events ------------------
+
+# Blackjack (simple text-controlled version)
+@bot.command(name='blackjack', aliases=['bj','bbj'])
+async def blackjack_cmd(ctx, bet: int = 0):
+    uid = ctx.author.id
     if bet <= 0:
-        await ctx.send("💸 Dùng: `bbj <số xu cược>`.")
-        return
-
-    bal = get_balance(ctx.author.id)
-    if bal < bet:
-        await ctx.send("❌ Bạn không đủ xu để cược.")
-        return
-
-    update_balance(ctx.author.id, -bet)
-
-    cards = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-    def card_value(c): return 10 if c in ["J", "Q", "K"] else (11 if c == "A" else int(c))
-
-    player = [random.choice(cards), random.choice(cards)]
-    dealer = [random.choice(cards), random.choice(cards)]
-
+        return await ctx.send("💸 Dùng: bbj <số xu cược>")
+    if get_balance(uid) < bet:
+        return await ctx.send("❌ Không đủ xu.")
+    update_balance(uid, -bet)
+    # deck simplified: use ranks
+    ranks = ['A','2','3','4','5','6','7','8','9','10','J','Q','K']
+    def val(r):
+        if r in ['J','Q','K']: return 10
+        if r == 'A': return 11
+        return int(r)
     def total(hand):
-        t = sum(card_value(c) for c in hand)
-        aces = hand.count("A")
-        while t > 21 and aces:
-            t -= 10
-            aces -= 1
-        return t
-
-    await ctx.send(f"🃏 **Bài của bạn:** {', '.join(player)} (Tổng {total(player)})\n💀 **Bài Dealer:** {dealer[0]}, ?")
-
+        s = sum(val(x) for x in hand)
+        aces = hand.count('A')
+        while s > 21 and aces:
+            s -= 10; aces -= 1
+        return s
+    player = [random.choice(ranks), random.choice(ranks)]
+    dealer = [random.choice(ranks), random.choice(ranks)]
+    await ctx.send(f"🃏 Bài bạn: {', '.join(player)} (Tổng {total(player)})\n💀 Dealer: {dealer[0]}, ?")
     while total(player) < 21:
-        await ctx.send("➡️ Gõ `rút` để rút thêm, hoặc `dừng` để đứng.")
+        await ctx.send("➡️ Gõ `rút` để rút thêm hoặc `dừng` để kết thúc.")
         try:
-            msg = await bot.wait_for(
-                "message",
-                check=lambda m: m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ["rút", "rut", "dừng", "dung"],
-                timeout=30
-            )
+            msg = await bot.wait_for('message', check=lambda m: m.author==ctx.author and m.channel==ctx.channel and m.content.lower() in ['rút','rut','dừng','dung'], timeout=30)
         except asyncio.TimeoutError:
-            await ctx.send("⌛ Hết thời gian! Tính là dừng.")
+            await ctx.send("⌛ Hết thời gian, tự động dừng.")
             break
-
-        if msg.content.lower() in ["rút", "rut"]:
-            player.append(random.choice(cards))
-            await ctx.send(f"🃏 Bạn rút được {player[-1]} (Tổng {total(player)})")
+        if msg.content.lower() in ['rút','rut']:
+            player.append(random.choice(ranks))
+            await ctx.send(f"🃏 Bạn rút {player[-1]} (Tổng {total(player)})")
         else:
             break
-
-    player_total = total(player)
-    if player_total > 21:
-        await ctx.send(f"💥 Bạn quắc rồi ({player_total}) 😭 Mất {bet} xu.")
-        return
-
-    # Dealer rút
+    pt = total(player)
+    if pt > 21:
+        return await ctx.send(f"💥 Quắc rồi! Mất {bet} xu.")
     while total(dealer) < 17:
-        dealer.append(random.choice(cards))
-
-    dealer_total = total(dealer)
-    await ctx.send(f"💀 Dealer có {', '.join(dealer)} (Tổng {dealer_total})")
-
-    if dealer_total > 21 or player_total > dealer_total:
-        await ctx.send(f"🏆 Bạn thắng! Nhận {bet * 2} xu 🎉")
-        update_balance(ctx.author.id, bet * 2)
-    elif player_total == dealer_total:
-        await ctx.send("😐 Hòa, hoàn tiền cược.")
-        update_balance(ctx.author.id, bet)
+        dealer.append(random.choice(ranks))
+    dt = total(dealer)
+    await ctx.send(f"💀 Dealer: {', '.join(dealer)} (Tổng {dt})")
+    if dt>21 or pt>dt:
+        update_balance(uid, bet*2)
+        await ctx.send(f"🏆 Bạn thắng! Nhận {bet*2} xu.")
+    elif pt==dt:
+        update_balance(uid, bet)
+        await ctx.send("😐 Hòa, hoàn lại cược.")
     else:
-        await ctx.send(f"💔 Dealer thắng! Bạn mất {bet} xu.")
+        await ctx.send(f"💔 Dealer thắng, bạn mất {bet} xu.")
 
-
-# ------------------------------
-# Hunt (bhunt)
-# ------------------------------
-@bot.command(name="hunt", aliases=["bhunt"])
-async def hunt(ctx):
-    """Đi săn thú rừng nhận xu"""
-    animals = ["🐗", "🐻", "🐇", "🦌", "🐍", "🐊", "🐒"]
-    animal = random.choice(animals)
-    reward = random.randint(50, 200)
-    await ctx.send(f"🏹 {ctx.author.display_name} đã săn được {animal} và nhận {reward} xu!")
-    update_balance(ctx.author.id, reward)
-
-
-# ------------------------------
-# PVP (bpvp)
-# ------------------------------
-@bot.command(name="pvp", aliases=["bpvp"])
-async def pvp(ctx, member: discord.Member = None, bet: int = 0):
-    """Đấu người chơi khác"""
-    if not member:
-        await ctx.send("⚔️ Dùng: `bpvp @người_chơi <xu_cược>`.")
+# on_message converter b... -> !...
+@bot.event
+async def on_message(message):
+    if message.author.bot:
         return
-    if member == ctx.author:
-        await ctx.send("😅 Không thể tự đấu chính mình.")
-        return
-    if bet <= 0:
-        await ctx.send("💸 Cược phải > 0 xu.")
-        return
+    # nếu message dạng "bcmd" hoặc "bcmd args..." thì chuyển nội bộ thành !cmd
+    if message.content and message.content.startswith('b') and len(message.content) > 1:
+        # tránh khi người dùng gõ bắt đầu b và theo sau là space (vd: "b hello") => không đổi
+        if not message.content.startswith('b '):
+            message.content = '!' + message.content[1:]
+    await bot.process_commands(message)
 
-    bal1 = get_balance(ctx.author.id)
-    bal2 = get_balance(member.id)
-    if bal1 < bet or bal2 < bet:
-        await ctx.send("❌ Một trong hai người không đủ xu.")
-        return
+# welcome & goodbye
+@bot.event
+async def on_member_join(member):
+    ch = bot.get_channel(WELCOME_CHANNEL_ID)
+    if ch:
+        try:
+            update_balance(member.id, 100)
+        except:
+            pass
+        await ch.send(random.choice(WELCOME_MESSAGES).format(name=member.mention))
 
-    await ctx.send(f"⚔️ {ctx.author.mention} thách đấu {member.mention} với **{bet} xu**! Gõ `chấp nhận` để đồng ý.")
+@bot.event
+async def on_member_remove(member):
+    ch = bot.get_channel(WELCOME_CHANNEL_ID)
+    if ch:
+        await ch.send(random.choice(GOODBYE_MESSAGES).format(name=member.display_name))
+        # ------------------ PART 6/6: TTS, ADMIN, PING, RUN ------------------
+import io, aiohttp
 
+# TTS command (btts)
+@bot.command(name='tts', aliases=['btts','b'])
+async def tts_cmd(ctx, *, text: str = None):
+    if not text:
+        return await ctx.send("🗣️ Dùng: btts <nội dung>")
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("🔊 Bạn phải ở trong kênh voice để dùng lệnh.")
+    voice_channel = ctx.author.voice.channel
+    # đảm bảo bot vào đúng kênh
+    if ctx.voice_client is None:
+        await voice_channel.connect()
+    elif ctx.voice_client.channel != voice_channel:
+        await ctx.voice_client.move_to(voice_channel)
+    # tạo tts file tạm
     try:
-        msg = await bot.wait_for(
-            "message",
-            check=lambda m: m.author == member and m.channel == ctx.channel and m.content.lower() == "chấp nhận",
-            timeout=30
-        )
-    except asyncio.TimeoutError:
-        await ctx.send("⌛ Hết thời gian, trận đấu bị hủy.")
+        tts = gTTS(text=text, lang='vi', slow=False)
+        tmp = tempfile.gettempdir()
+        fp = os.path.join(tmp, f"tts_{ctx.message.id}_{int(time.time())}.mp3")
+        tts.save(fp)
+    except Exception as e:
+        return await ctx.send(f"❌ Lỗi tạo TTS: {e}")
+    try:
+        vc = ctx.voice_client
+        if vc.is_playing():
+            vc.stop()
+        source = discord.FFmpegPCMAudio(fp)
+        vc.play(source)
+        await ctx.send(f"🔊 Đang đọc: `{text}`")
+        while vc.is_playing():
+            await asyncio.sleep(0.5)
+        await vc.disconnect()
+    except Exception as e:
+        await ctx.send(f"❌ Lỗi phát: {e}")
+    finally:
+        if os.path.exists(fp):
+            try: os.remove(fp)
+            except: pass
+
+# stop/leave
+@bot.command(name='stoptts', aliases=['bstop','bleave'])
+async def stop_tts(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Đã rời kênh voice.")
+    else:
+        await ctx.send("🚫 Bot không ở kênh voice.")
+
+# admin give
+@bot.command(name='admingive')
+@commands.has_permissions(administrator=True)
+async def admin_give(ctx, member: discord.Member, amount: int):
+    if amount <= 0:
+        return await ctx.send("Số tiền phải > 0.")
+    update_balance(member.id, amount)
+    await ctx.send(f"✅ Đã cộng {amount} xu cho {member.display_name}.")
+
+# ping
+@bot.command(name='ping', aliases=['lat'])
+async def ping_cmd(ctx):
+    await ctx.send(f"🏓 Pong! {round(bot.latency*1000)}ms")
+
+# finalize and run
+print("[✅ TẢI TOÀN BỘ MODULE THÀNH CÔNG]")
+# ------------------------------
+# PHẦN 6: PVP / PROFILE / GIFT / RANK / EVENT / WELCOME
+# ------------------------------
+
+@bot.command(name="bpvp")
+async def pvp(ctx, member: discord.Member):
+    if member == ctx.author:
+        await ctx.send("🤨 Bạn không thể đánh chính mình được.")
         return
-
-    await ctx.send("🎲 Đang tung xúc xắc quyết định thắng thua...")
-    await asyncio.sleep(2)
-
+    user = get_user(ctx.author.id)
+    target = get_user(member.id)
+    if user["coin"] < 50 or target["coin"] < 50:
+        await ctx.send("💸 Cả hai người cần ít nhất 50 xu để tham gia trận đấu.")
+        return
     winner = random.choice([ctx.author, member])
     loser = member if winner == ctx.author else ctx.author
+    user_w = get_user(winner.id)
+    user_l = get_user(loser.id)
+    reward = random.randint(50, 150)
+    user_w["coin"] += reward
+    user_l["coin"] -= 50
+    save_data(users)
+    await ctx.send(f"⚔️ **{winner.name}** đã thắng và nhận được **{reward} 💰**!")
 
-    update_balance(winner.id, bet)
-    update_balance(loser.id, -bet)
+@bot.command(name="bprofile")
+async def profile(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    data = get_user(member.id)
+    pets = ", ".join(data.get("pets", [])) or "Không có"
+    inv = len(data.get("inventory", []))
+    embed = discord.Embed(title=f"👤 Hồ sơ của {member.name}", color=0xaaaaee)
+    embed.add_field(name="💰 Tiền:", value=f"{data['coin']} xu", inline=False)
+    embed.add_field(name="🐾 Pet:", value=pets, inline=False)
+    embed.add_field(name="🎒 Túi đồ:", value=f"{inv} món", inline=False)
+    await ctx.send(embed=embed)
 
-    await ctx.send(f"🏆 {winner.mention} thắng và nhận **{bet} xu!** 💰")
+@bot.command(name="bgift")
+async def gift(ctx, member: discord.Member, amount: int):
+    sender = get_user(ctx.author.id)
+    receiver = get_user(member.id)
+    if sender["coin"] < amount:
+        await ctx.send("💸 Bạn không đủ tiền để tặng.")
+        return
+    sender["coin"] -= amount
+    receiver["coin"] += amount
+    save_data(users)
+    await ctx.send(f"🎁 {ctx.author.name} đã tặng {member.name} **{amount} 💰**!")
 
+@bot.command(name="brank")
+async def rank(ctx):
+    sorted_users = sorted(users.items(), key=lambda x: x[1].get("coin", 0), reverse=True)
+    top = ""
+    for i, (uid, data) in enumerate(sorted_users[:10], start=1):
+        member = await bot.fetch_user(int(uid))
+        top += f"{i}. {member.name} - {data['coin']} 💰\n"
+    embed = discord.Embed(title="🏆 Bảng xếp hạng top 10", description=top, color=0xffd700)
+    await ctx.send(embed=embed)
 
 # ------------------------------
-# Team (bteam)
+# AUTO EVENT - RANDOM COIN KHI CHAT
 # ------------------------------
-teams = {}
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    user = get_user(message.author.id)
+    gain = random.randint(1, 5)
+    user["coin"] += gain
+    save_data(users)
+    await bot.process_commands(message)
 
-@bot.command(name="team", aliases=["bteam"])
-async def team(ctx, action=None, *, name=None):
-    """Tạo hoặc xem team"""
-    uid = ctx.author.id
-    if action == "tạo" and name:
-        if uid in teams:
-            await ctx.send("❌ Bạn đã có team rồi.")
-            return
-        teams[uid] = {"name": name, "members": [ctx.author.id]}
-        await ctx.send(f"👥 Team **{name}** được tạo thành công!")
-    elif action == "mời" and name:
-        target = ctx.message.mentions[0] if ctx.message.mentions else None
-        if not target:
-            await ctx.send("⚠️ Dùng: `bteam mời @tên`.")
-            return
-        for t in teams.values():
-            if ctx.author.id in t["members"]:
-                t["members"].append(target.id)
-                await ctx.send(f"✅ {target.display_name} đã được mời vào team **{t['name']}**!")
-                return
-        await ctx.send("❌ Bạn chưa có team để mời người khác.")
-    elif action == "xem":
-        for t in teams.values():
-            if uid in t["members"]:
-                member_names = []
-                for m in t["members"]:
-                    member_obj = ctx.guild.get_member(m)
-                    if member_obj:
-                        member_names.append(member_obj.display_name)
-                await ctx.send(f"👥 Team **{t['name']}** gồm: {', '.join(member_names)}")
-                return
-        await ctx.send("😅 Bạn chưa ở trong team nào.")
+# ------------------------------
+# AUTO WELCOME
+# ------------------------------
+@bot.event
+async def on_member_join(member):
+    channel = discord.utils.get(member.guild.text_channels, name="chào-mừng")
+    if channel:
+        await channel.send(f"👋 Chào mừng {member.mention} đến với server! 💖")
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ Vui lòng đặt DISCORD_TOKEN env var.")
     else:
-        await ctx.send("📘 Dùng: `bteam tạo <tên>` | `bteam mời @ai` | `bteam xem`.")
-
-
-# ------------------------------
-# Kết thúc
-# ------------------------------
-print("[✅ TẢI TOÀN BỘ MODULE THÀNH CÔNG]")
-def get_game_status_embed(show_dealer_card=False, is_game_over=False):
-        player_cards_str = ", ".join(card_to_string(c) for c in player_hand)
-        player_score = calculate_hand_value(player_hand)
-        if show_dealer_card or is_game_over:
-            dealer_cards_str = ", ".join(card_to_string(c) for c in dealer_hand)
-            dealer_score = calculate_hand_value(dealer_hand)
-            dealer_display = f"**{dealer_score}** ({dealer_cards_str})"
-    
+        bot.run(TOKEN)
+        
