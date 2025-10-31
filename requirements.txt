@@ -1,5 +1,4 @@
 discord.py[voice]
 gTTS
-sqlite3
 ffmpeg-python
 
